@@ -1,0 +1,337 @@
+---
+title: "Investigation of the effects of restaurant characteristics on average ratings"
+subtitle: "Expanded Report"
+author: "Felipe Campelo"
+date: "November 18, 2015"
+output: pdf_document
+---
+
+## Introduction 
+
+In this study I'll investigate the factors that may affect the average ratings of restaurants. The primary question of this work can be stated as: _**What are the variables that have the largest impact in the average ratings of restaurants, and what is the magnitude of their effects?**_
+
+To that end the information available in the [Yelp Dataset](http://www.yelp.com/dataset_challenge) will be employed. 
+
+**Disclaimer**: This work was developed for the _Data Science Specialization Capstone Project_. It is not intended as an exhaustive evaluation of all possibilities, nor as a scientific evaluation of causal relationships - its very nature as a retrospective analysis based on self-selected reporting (i.e., the reviews available in the Yelp dataset) precludes inferences of causality, and allows only (at most) conclusions about correlational effects.
+
+## Methods and Data 
+
+In this section the methods used for each step of the analysis are introduced. The analysis is divided into four main steps. The methods employed for each one are described in the subsections below, and the results of each step are detailed in the **Results** section.
+
+### Data Cleanup and Exploratory Analysis
+Initially the compressed data was obtained from the [Yelp Dataset Challenge downloads page](https://www.yelp.com/dataset_challenge/dataset). After downloading and decompressing the data, the _JSON_ files containing the review, business, tip, checkin and business information were parsed using the [jsonlite package](https://cran.r-project.org/package=jsonlite), and the resulting dataframes were saved to **RDS** files, which are smaller and quicker to load. 
+
+To address the question of interest of this work, some filtering was necessary to isolate the relevant observations from the superfluous information. The following filtering steps were performed:  
+- Only observations of businesses categorized as _restaurant_ were used;  
+- Only restaurants with more than 30 reviews were used (to get some level of robustness on the estimator of the average rating);  
+- Attributes that do not make sense for a restaurant (e.g., _Hair Types Specialized In_) were removed;  
+- Attributes with more than 50% missing observations were removed;  
+- Observations that contained attributes with extremely low occurrences (e.g., _Attire == "formal"_) were removed to prevent extremely unbalanced situations;  
+- Only complete cases (i.e., cases with no missing attribute values) were considered;  
+- For each restaurant, the output variable was calculated as the average number of stars given to that establishment.
+
+After the initial data exploration and cleanup were performed, the relevant data for the question of interest was consolidated as a single data frame, which was also saved in the **RDS** format for faster loading.
+
+### Statistical Modeling
+To investigate the most influential factors in the average ratings, an analysis of variance model (linear regression on categorical predictors) was fitted to the data. Afterwards, an AIC-based stepwise pruning routine was used to obtain a more parsimonious model, by removing the terms which do not contribute significantly to the overall explanatory power of the model.
+
+### Graphical Analysis
+Effect sizes were calculated for all remaining terms of the regression model and plotted, to allow a graphical investigation of the strongest effects on the average star rating. The most important effects were then isolated and used to generate effects plots, which were used as the basis for my final considerations and discussions.
+
+## Results 
+
+### Data Cleanup and Exploratory Analysis
+Initially, the **JSON** files were parsed and saved as **RDS**:
+```{r getclean1, eval = FALSE}
+library(jsonlite)
+filenames <- c("business", "checkin", "tip", "user", "review")
+files     <- paste0("../data/yelp_academic_dataset_", filenames, ".json")
+outnames  <- paste0("../data/0_", filenames, ".rds")
+for (i in 1:5){
+  mydata <- jsonlite::stream_in(con = file(files[i ]), pagesize = 10000)
+  saveRDS(mydata, outnames[i])
+  assign(filenames[i], mydata)
+}
+rm(mydata) # free memory
+```
+
+```{r loaddata, echo=FALSE, cache = TRUE}
+business <- readRDS("../data/0_business.rds")
+checkin  <- readRDS("../data/0_checkin.rds")
+tip      <- readRDS("../data/0_tip.rds")
+user     <- readRDS("../data/0_user.rds")
+review   <- readRDS("../data/0_review.rds")
+```
+
+To visualize the location of the cities, I plotted the data using the **maps** package:
+```{r explore01}
+library(maps)
+map("world", 
+    ylim = c(20, 60), 
+    xlim = c(-130, 20), 
+    col = "gray60")
+points(business$longitude, 
+       business$latitude,
+       pch = 20, 
+       col = "cyan4")
+```
+
+After that the restaurants that had more than 30 reviews were detected:
+
+```{r getclean2, eval = FALSE}
+getRestID <- function(i, V, nrev){
+  if(any(c("restaurants", "restaurant") %in% tolower(V$categories[[i]])) 
+     && V$review_count[i] >= nrev){
+    return(V$business_id[i])} else return(NA)
+}
+
+restIDs <- na.exclude(unlist(lapply(1:nrow(business), FUN  = getRestID, 
+                                    V = business, nrev = 30)))
+
+```
+
+I then proceeded to do some more data cleanup and preprocessing : 
+
+- Merge _Good for Kids_ and _Good For Kids_ columns (notice the case difference);
+- Convert the _Accepts Credit Cards_ variable to logical;
+- Removed (useless) attributes _Hair Types Specialized In_ and _Accepts Insurance_;
+
+```{r cleanup02, eval = FALSE}
+# 1) Merge $`Good for Kids` and $`Good For Kids` columns
+business$attributes$`Good for Kids`[is.na(business$attributes$`Good for Kids`)] <- 0
+business$attributes$`Good for Kids` <- business$attributes$`Good for Kids` ||
+	business$attributes$`Good For Kids`
+business$attributes$`Good For Kids` <- NULL
+
+# 2) Convert $`Accepts Credit Cards` to logical
+business$attributes$`Accepts Credit Cards` <-
+	lapply(business$attributes$`Accepts Credit Cards`, function(x) if(!length(x)) x[[1]] <- NA else x)
+business$attributes$`Accepts Credit Cards` <- 
+	unlist(business$attributes$`Accepts Credit Cards`)
+
+# Remove incoherent columns
+business$attributes$`Hair Types Specialized In` <- NULL
+business$attributes$`Accepts Insurance`<- NULL
+```
+
+After that, a data frame with all the relevant information was built:
+
+```{r buildDF, eval = FALSE}
+# Function to build list of relevant review information
+getRestaurant <- function(ID, Xbus, Xrev){
+  xbus <- subset(Xbus, business_id == ID)
+  xrev <- subset(Xrev, business_id == ID)
+  
+  # get indices of columns of class "data frame" in xbus$attributes
+  dfinds <- as.integer(which(unlist(lapply(business$attributes, is.data.frame))))
+  
+  try(rm(buscols))
+  for (i in dfinds){
+    newcols<- as.data.frame(xbus$attributes[, i])
+    names(newcols) <- paste(names(xbus$attributes)[i], 
+                            names(newcols),
+                            sep = ".")
+    if(!exists("buscols")) {
+      buscols <- newcols
+    } else buscols <- cbind(buscols, newcols)
+  }
+  
+  buscols <- cbind(xbus$attributes[, -dfinds], buscols)
+  Stars   <- mean(xrev$stars)
+  
+  data.frame(buscols, Stars)
+}
+
+RestData <- lapply(X    = restIDs,
+			 FUN  = getRestaurant,
+			 Xbus = business,
+			 Xrev = review)
+
+RestDF <- data.frame(
+            matrix(unlist(RestData), 
+                   nrow  = length(RestData), 
+                   byrow = TRUE))
+names(RestDF) <- names(RestData[[1]])
+
+# Remove columns that are more than 50% NA
+nainds <- which(
+            unlist(
+              parallel::mclapply(RestDF, 
+                                 function(x) sum(is.na(x))/length(x) > 0.50)))
+RestDF <- RestDF[, -nainds]
+
+# Remove levels / factors that would lead to extreme unbalance
+summary(RestDF)
+RestDF <- RestDF[-which(RestDF$Attire=="formal"), ]
+RestDF$Attire <- factor(RestDF$Attire)
+
+# Turn all independent variables into factors
+RestDF[, -ncol(RestDF)] <- lapply(RestDF[, -ncol(RestDF)], as.factor)
+
+#Turn the dependent variable into numeric
+RestDF$Stars <- as.numeric(as.character(RestDF$Stars))
+
+# Select only complete cases
+RestDF <- RestDF[complete.cases(RestDF), ]
+
+saveRDS(RestData, "../data/RestData.rds")
+saveRDS(RestDF,   "../data/RestDF.rds")
+```
+
+At the end of the process, a data frame with the following fields was generated:
+
+```{r loadRestDF, eval=TRUE, echo=FALSE, results=TRUE}
+# load data
+RestDF<- readRDS("../data/RestDF.rds")
+
+# Turn independent variables into factors
+RestDF[, -ncol(RestDF)] <- lapply(RestDF[, -ncol(RestDF)], as.factor)
+
+#Turn dependent variable into numeric
+RestDF$Stars <- as.numeric(as.character(RestDF$Stars))
+
+# Select only complete cases
+RestDF <- RestDF[complete.cases(RestDF), ]
+```
+
+```{r RestDFNames, echo=FALSE}
+library(printr)
+cols1 <- c(1, 2, 3, 11, 15)
+cols2 <- c(4, 5, 6, 8, 13, 14, 36)
+cols3 <- c(31, 32, 33, 34, 35, 26)
+cols4 <- c(10, 17:21)
+cols5 <- c(9, 15, 22:25)
+cols6 <- c(27:30, 12, 7)
+summary(RestDF[, cols1])
+summary(RestDF[, cols3])
+summary(RestDF[, cols4])
+summary(RestDF[, cols5])
+summary(RestDF[, cols6])
+summary(RestDF[, cols2])
+```
+
+In this summary dataframe all regressor variables were expressed as factors, the response variable (_Stars_) was a numeric vector, and only complete cases were present.
+
+### Statistical Modeling
+The regression model was fit and simplified as follows:
+
+```{r regress01, cache = TRUE, fig.height = 2}
+model1 <- lm(Stars ~ ., data = RestDF)
+model2 <- step(model1, trace = 0)
+summary.aov(model2)
+summary.lm(model2)$r.squared
+par(mfrow = c(1,4)); plot(model2, pch=20, cex=.7, col = rgb(0,0,0,0.1))
+```
+Notice that only the main effects were used as regressors, which makes this model rather simple but adequate for an initial investigation of the factor effects. The proportion of explained variability in the final model is relatively low (`r signif(summary.lm(model2)$r.squared,5)`), which may be due to the effect of interactions being absorbed by the residual term in the model, as well as the effect of undocumented variables. The residual plot of _model2_ suggests that no large violations of the verifiable assumptions of the linear model (normality, homoscedasticity) are likely to be present.
+
+### Graphical Analysis
+The effect sizes and confidence intervals were calculated and plotted using the **effects** package. 
+
+```{r myeffs0, cache = TRUE, fig.height=8, fig.width=7}
+library(effects)
+Effs <- allEffects(model2)
+plot(Effs[1:12], main = effect, ylim = c(3.2, 4.1), 
+     grid = TRUE, col = 3, row = 4)
+
+```{r myeffs1, cache = TRUE, fig.height=9, fig.width=7}
+plot(Effs[13:26], main = effect, ylim = c(3.2, 4.1), 
+     grid = TRUE, col = 3, row = 5)
+```
+
+By examining this plot, two groups of variables were clearly shown to have interesting effects: The first were _Noise Level_, _Price Range_, _Alcohol_, _Wi-fi_ and _Attire_, while the second were the ones related to the _Ambience_ of the restaurant. To explore these effects in more detail, two plots were generated using the **ggplot2** package:  
+
+```{r prepareGG1, eval=TRUE,echo=TRUE,results=TRUE,cache=TRUE,fig.height=5}
+par(mfrow = c(1,1))
+
+get_effect_data <- function(effname, Efflist){
+  myEff <- Efflist[[effname]]
+  xbar  <- myEff[["fit"]]
+  xse   <- myEff[["se"]]
+  lvls  <- myEff[["variables"]][[effname]][["levels"]]
+  ind   <- order(xbar)
+  xbar  <- xbar[ind]
+  xse   <- xse[ind]
+  lvls  <- lvls[ind]
+  lvnm  <- (seq_along(lvls) - 1) / (length(lvls) - 1)
+  
+  return(data.frame(Effect   = rep(effname, length(xse)),
+                    Level    = as.character(lvls),
+                    LevelNum = lvnm,
+                    Estimate = xbar,
+                    StErr    = xse))
+}
+
+effnames <- c("Noise.Level", "Price.Range", "Alcohol", "Wi.Fi", "Attire")
+ambnames <- names(Effs)[grep("Ambience", names(Effs))]
+
+mainEffs <- lapply(X = effnames, FUN = get_effect_data, Efflist = Effs)
+AmbEffs  <- lapply(X = ambnames, FUN = get_effect_data, Efflist = Effs)
+
+mainEffs <- do.call(what = rbind, args = mainEffs)
+AmbEffs  <- do.call(what = rbind, args = AmbEffs)
+
+rownames(mainEffs) <- seq_along(mainEffs[,1])
+rownames(AmbEffs)  <- seq_along(AmbEffs[,1])
+
+mainEffs$Level <- 
+	c("Noise: very loud", "Noise: loud", "Noise: average", "Noise: quiet",
+	  "Price: 2", "Price: 1", "Price: 3", "Price: 4",
+	  "Full bar", "Beer and Wine", "No Alcohol",
+	  "Wi-fi: paid", "Wi-fi: none", "Wi-fi: free",
+	  "Casual Attire", "Dressy")
+
+
+AmbEffs$Level <- c(" ", "Romantic",
+                   " ", "Intimate",
+                   " ", "Classy",
+                   " ", "Hipster",
+                   "Touristy", " ",
+                   " ", "Trendy",
+                   " ", "Casual")
+
+library(ggplot2)
+p1 <- ggplot(data = mainEffs, 
+             mapping = aes(group = Effect, x = LevelNum, y = Estimate, color = Effect,
+                           ymax  = Estimate + StErr, ymin  = Estimate - StErr))
+
+p1 + 
+	geom_pointrange(size = 1, position = position_dodge(width  = 0.4)) + 
+	geom_line(size = .3, linetype = 1, position = position_dodge(width  = 0.4)) + 
+	geom_text(aes(x = LevelNum + 0.05, y = Estimate + 0.02, label = Level),
+		    position = position_dodge(width  = 0.4), size = 4) + 
+	ggtitle("Estimated average rating for influential variables") +
+	theme(legend.position = "none",
+		axis.title.x = element_blank(), axis.text.x  = element_blank(),
+		axis.title.y = element_text(size = 14), axis.text.y  = element_text(size = 12),
+		plot.title   = element_text(size = 16)) + 
+	scale_x_continuous(limits = c(-0.2, 1.3))
+```
+
+```{r prepareGG2, eval=TRUE,echo=TRUE,results=TRUE,cache=TRUE,fig.height=5}
+p3 <- ggplot(data = AmbEffs, 
+             mapping = aes(group = Effect, x = LevelNum, y = Estimate, color = Effect,
+                           ymax  = Estimate + StErr, ymin  = Estimate - StErr))
+
+p3 + 
+	geom_pointrange(size = 1, position = position_dodge(width  = 0.4)) + 
+	geom_line(size = .3, linetype = 1, position = position_dodge(width  = 0.4)) +
+	geom_text(aes(x = LevelNum + 0.1, y = Estimate + 0.02, label = Level),
+		    position = position_dodge(width  = 0.4), size = 4) + 
+  ggtitle("Estimated average rating for the Ambience variables") +
+  theme(legend.position = "none",
+        axis.title.x = element_blank(), axis.text.x  = element_blank(),
+        axis.title.y = element_text(size = 14), axis.text.y  = element_text(size = 12),
+        plot.title   = element_text(size = 16)) + 
+	scale_x_continuous(limits = c(-0.2, 1.3))
+```
+
+## Discussion 
+
+The results obtained in the previous section allow the inference of some interesting effects, that may help answering my question of interest (_what variables present the strongest effects on the average ratings of restaurants_):
+
+1. The rating tends to go up as the price increases, which is relatively intuitive. However, _Price Range = 2_ had a lower average rating than _Price Range = 1_, suggesting that very cheap places may benefit from some sort of "low expectations effect";  
+1. The level of noise is also a strong predictor of the ratings, with _quiet_ places gaining on average 0.3 stars more than _very loud_ ones. The difference between _Noise: average_ and _Noise: quiet_ is, however, quite low;  
+1. People seems to get quite angry at places that charge for Wi-fi, much more than at places that do not provide it. The message to restaurants seems to be clear: if you provide Wi-fi, do it for free. Otherwise, don't even bother, as _paid Wi-fi_ tends to drop mean ratings by an average 0.3 stars compared to no _No Wi-fi_;  
+1. Places with _full bar_ tend to be ranked lower than those with _Beer and Wine_ bars and those without Alcohol (maybe due to lots of drunk people bothering other customers?);  
+1. Hipster, Trendy and Intimate Ambiences tend to generate palpable increases in the average rating of restaurants. It is possible that these variables present some high level of collinearity (experience suggests that trendy and hipster are possibly very correlated, but I did not investigate it in this report.);  
+1. Touristy restaurants tend to be ranked much lower than non-touristy. Again, it is very possible that _touristy_ correlates negatively with _hipster_ or _intimate_, but this effect was not investigated here;
